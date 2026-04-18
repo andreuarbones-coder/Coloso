@@ -19,7 +19,7 @@ const rtcConfiguration = {
   ]
 };
 
-export default function AudioCaster() {
+export default function App() {
   const [user, setUser] = useState(null);
   const [mode, setMode] = useState('select'); // 'select', 'host', 'client'
   const [status, setStatus] = useState('idle'); // 'idle', 'waiting', 'connecting', 'connected', 'error'
