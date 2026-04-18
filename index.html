@@ -1,0 +1,482 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Monitor, Smartphone, Play, Square, Wifi, AlertCircle, Headphones, Volume2, ShieldCheck, Copy, CheckCircle2 } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, updateDoc, collection, addDoc, onSnapshot } from 'firebase/firestore';
+
+// --- CONFIGURACIÓN DE FIREBASE ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// Configuración de los servidores STUN para WebRTC
+const rtcConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' }
+  ]
+};
+
+export default function AudioCaster() {
+  const [user, setUser] = useState(null);
+  const [mode, setMode] = useState('select'); // 'select', 'host', 'client'
+  const [status, setStatus] = useState('idle'); // 'idle', 'waiting', 'connecting', 'connected', 'error'
+  const [errorMsg, setErrorMsg] = useState('');
+  const [roomId, setRoomId] = useState('');
+  const [pinInput, setPinInput] = useState('');
+  const [copied, setCopied] = useState(false);
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+
+  const localStreamRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const remoteAudioRef = useRef(null);
+  const unsubscribesRef = useRef([]);
+
+  // --- 1. INICIALIZACIÓN DE SESIÓN (Regla de Firebase) ---
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Error de autenticación:", error);
+      }
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // --- LIMPIEZA GENERAL ---
+  const cleanup = () => {
+    unsubscribesRef.current.forEach(unsub => unsub());
+    unsubscribesRef.current = [];
+
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+    }
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = null;
+    }
+
+    setStatus('idle');
+    setRoomId('');
+    setErrorMsg('');
+    setIsAudioPlaying(false);
+  };
+
+  const stopSession = () => {
+    cleanup();
+    setMode('select');
+  };
+
+  // Referencias a las rutas de Firestore
+  const getRoomRef = (id) => doc(db, 'artifacts', appId, 'public', 'data', 'rooms', id);
+  const getCallerCandidatesRef = (id) => collection(db, 'artifacts', appId, 'public', 'data', 'rooms', id, 'callerCandidates');
+  const getCalleeCandidatesRef = (id) => collection(db, 'artifacts', appId, 'public', 'data', 'rooms', id, 'calleeCandidates');
+
+  // --- MODO TRANSMISOR (PC) ---
+  const startHosting = async () => {
+    if (!user) return;
+    cleanup();
+    setErrorMsg('');
+    setStatus('waiting');
+
+    try {
+      // 1. Obtener audio del sistema
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { displaySurface: "monitor" }, // Requerido por la mayoría de navegadores para capturar audio
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } // Audio en alta fidelidad
+        });
+      } catch (err) {
+        throw new Error("Permiso denegado. Debes aceptar compartir pantalla y el audio.");
+      }
+
+      if (stream.getAudioTracks().length === 0) {
+        stream.getTracks().forEach(t => t.stop());
+        throw new Error("No se detectó audio. Asegúrate de marcar la opción 'Compartir audio del sistema' en la ventana emergente.");
+      }
+
+      // Detenemos el video para ahorrar ancho de banda, pero mantenemos vivo el stream
+      // Nota: En algunos navegadores detener el video detiene todo, así que simplemente no lo enviamos por WebRTC
+      localStreamRef.current = stream;
+
+      // Detectar cuando el usuario detiene la compartición desde el botón del navegador
+      stream.getVideoTracks()[0].onended = () => {
+        stopSession();
+      };
+
+      // 2. Crear conexión WebRTC
+      const pc = new RTCPeerConnection(rtcConfiguration);
+      peerConnectionRef.current = pc;
+
+      // Enviar solo la pista de audio
+      stream.getAudioTracks().forEach(track => {
+        pc.addTrack(track, stream);
+      });
+
+      // 3. Generar PIN de la sala
+      const newRoomId = Math.floor(100000 + Math.random() * 900000).toString(); // PIN de 6 dígitos
+      setRoomId(newRoomId);
+      const roomRef = getRoomRef(newRoomId);
+
+      // 4. Recopilar candidatos ICE locales (PC -> Firebase)
+      pc.onicecandidate = async (event) => {
+        if (event.candidate) {
+          await addDoc(getCallerCandidatesRef(newRoomId), event.candidate.toJSON());
+        }
+      };
+
+      // 5. Crear la Oferta (Offer)
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await setDoc(roomRef, {
+        offer: { type: offer.type, sdp: offer.sdp },
+        createdAt: new Date().getTime()
+      });
+
+      // 6. Escuchar la Respuesta (Answer) del teléfono
+      const unsubRoom = onSnapshot(roomRef, async (snapshot) => {
+        const data = snapshot.data();
+        if (!pc.currentRemoteDescription && data && data.answer) {
+          const answer = new RTCSessionDescription(data.answer);
+          await pc.setRemoteDescription(answer);
+        }
+      });
+      unsubscribesRef.current.push(unsubRoom);
+
+      // 7. Escuchar Candidatos ICE remotos (Teléfono -> PC)
+      const unsubCallee = onSnapshot(getCalleeCandidatesRef(newRoomId), (snapshot) => {
+        snapshot.docChanges().forEach(async (change) => {
+          if (change.type === 'added') {
+            const data = change.doc.data();
+            await pc.addIceCandidate(new RTCIceCandidate(data));
+          }
+        });
+      });
+      unsubscribesRef.current.push(unsubCallee);
+
+      // Monitorear estado de conexión
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') setStatus('connected');
+        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') setStatus('error');
+      };
+
+    } catch (error) {
+      console.error(error);
+      setErrorMsg(error.message);
+      setStatus('idle');
+    }
+  };
+
+  // --- MODO RECEPTOR (TELÉFONO) ---
+  const joinRoom = async (e) => {
+    e.preventDefault();
+    if (!user || !pinInput || pinInput.length !== 6) {
+      setErrorMsg("Por favor, ingresa un PIN válido de 6 dígitos.");
+      return;
+    }
+    
+    cleanup();
+    setStatus('connecting');
+    setErrorMsg('');
+
+    try {
+      const roomRef = getRoomRef(pinInput);
+      const roomSnap = await getDoc(roomRef);
+
+      if (!roomSnap.exists()) {
+        throw new Error("El PIN ingresado no existe o la sala fue cerrada.");
+      }
+
+      // 1. Crear conexión WebRTC
+      const pc = new RTCPeerConnection(rtcConfiguration);
+      peerConnectionRef.current = pc;
+
+      // 2. Al recibir el audio, asignarlo al reproductor
+      pc.ontrack = (event) => {
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = event.streams[0];
+          // Autoplay es bloqueado por navegadores móviles, forzamos inicio o pedimos interacción
+          remoteAudioRef.current.play().then(() => {
+            setIsAudioPlaying(true);
+          }).catch(() => {
+            setIsAudioPlaying(false); // Requiere clic del usuario
+          });
+        }
+      };
+
+      // 3. Recopilar candidatos ICE locales (Teléfono -> Firebase)
+      pc.onicecandidate = async (event) => {
+        if (event.candidate) {
+          await addDoc(getCalleeCandidatesRef(pinInput), event.candidate.toJSON());
+        }
+      };
+
+      // 4. Configurar Oferta remota y Crear Respuesta
+      const offer = roomSnap.data().offer;
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      await updateDoc(roomRef, { answer: { type: answer.type, sdp: answer.sdp } });
+
+      // 5. Escuchar Candidatos ICE remotos (PC -> Teléfono)
+      const unsubCaller = onSnapshot(getCallerCandidatesRef(pinInput), (snapshot) => {
+        snapshot.docChanges().forEach(async (change) => {
+          if (change.type === 'added') {
+            const data = change.doc.data();
+            await pc.addIceCandidate(new RTCIceCandidate(data));
+          }
+        });
+      });
+      unsubscribesRef.current.push(unsubCaller);
+
+      // Monitorear estado de conexión
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') setStatus('connected');
+        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') setStatus('error');
+      };
+
+    } catch (error) {
+      console.error(error);
+      setErrorMsg(error.message);
+      setStatus('idle');
+    }
+  };
+
+  const copyToClipboard = () => {
+    navigator.clipboard.writeText(roomId);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  // --- RENDERIZADO UI ---
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center text-slate-200">
+        <div className="animate-pulse flex flex-col items-center gap-4">
+          <Wifi className="w-8 h-8 text-blue-500" />
+          <p>Conectando con el servidor de señalización...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-blue-500/30">
+      <div className="max-w-md mx-auto p-6 flex flex-col min-h-screen">
+        
+        {/* Header */}
+        <header className="mb-10 mt-6 text-center">
+          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-blue-600/10 mb-4 border border-blue-500/20">
+            <Volume2 className="w-8 h-8 text-blue-400" />
+          </div>
+          <h1 className="text-3xl font-bold tracking-tight text-white mb-2">AudioCaster</h1>
+          <p className="text-slate-400 text-sm">Escucha el audio de tu PC en el celular vía Wi-Fi</p>
+        </header>
+
+        {/* PANTALLA PRINCIPAL: Selección de Rol */}
+        {mode === 'select' && (
+          <div className="flex-1 flex flex-col gap-4">
+            <button
+              onClick={() => setMode('host')}
+              className="flex items-center gap-4 p-6 bg-slate-900 border border-slate-800 rounded-2xl hover:bg-slate-800 hover:border-slate-700 transition-all group relative overflow-hidden"
+            >
+              <div className="absolute inset-0 bg-gradient-to-r from-blue-600/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+              <div className="bg-blue-500/20 p-4 rounded-xl text-blue-400">
+                <Monitor className="w-8 h-8" />
+              </div>
+              <div className="text-left flex-1">
+                <h3 className="text-lg font-semibold text-white mb-1">Transmitir desde PC</h3>
+                <p className="text-sm text-slate-400">Captura el audio de esta computadora para enviarlo.</p>
+              </div>
+            </button>
+
+            <button
+              onClick={() => setMode('client')}
+              className="flex items-center gap-4 p-6 bg-slate-900 border border-slate-800 rounded-2xl hover:bg-slate-800 hover:border-slate-700 transition-all group relative overflow-hidden"
+            >
+              <div className="absolute inset-0 bg-gradient-to-r from-emerald-600/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+              <div className="bg-emerald-500/20 p-4 rounded-xl text-emerald-400">
+                <Smartphone className="w-8 h-8" />
+              </div>
+              <div className="text-left flex-1">
+                <h3 className="text-lg font-semibold text-white mb-1">Recibir en Teléfono</h3>
+                <p className="text-sm text-slate-400">Escucha el audio conectándote mediante un PIN.</p>
+              </div>
+            </button>
+          </div>
+        )}
+
+        {/* MODO TRANSMISOR (PC) */}
+        {mode === 'host' && (
+          <div className="flex-1 flex flex-col">
+            <button onClick={stopSession} className="text-slate-400 text-sm hover:text-white mb-6 self-start flex items-center gap-2">
+              &larr; Volver
+            </button>
+
+            {status === 'idle' ? (
+              <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl text-center">
+                <div className="bg-amber-500/10 text-amber-400 text-sm p-4 rounded-xl mb-6 flex gap-3 text-left">
+                  <ShieldCheck className="w-6 h-6 shrink-0" />
+                  <p>Al hacer clic en Iniciar, se abrirá una ventana de Chrome. <b>Es obligatorio que marques la casilla "Compartir audio del sistema"</b> antes de aceptar.</p>
+                </div>
+                <button
+                  onClick={startHosting}
+                  className="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
+                >
+                  <Play className="w-5 h-5" />
+                  Iniciar Transmisión
+                </button>
+                {errorMsg && <p className="text-red-400 text-sm mt-4">{errorMsg}</p>}
+              </div>
+            ) : (
+              <div className="bg-slate-900 border border-slate-800 p-8 rounded-3xl flex flex-col items-center">
+                <div className={`w-24 h-24 rounded-full flex items-center justify-center mb-6 relative
+                  ${status === 'connected' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-blue-500/20 text-blue-400'}`}>
+                  {status === 'connected' ? <Headphones className="w-10 h-10" /> : <Monitor className="w-10 h-10" />}
+                  {status === 'waiting' && <div className="absolute inset-0 rounded-full border-2 border-blue-400/30 border-t-blue-400 animate-spin" />}
+                </div>
+
+                <h2 className="text-xl font-semibold mb-1">
+                  {status === 'waiting' && 'Esperando conexión...'}
+                  {status === 'connected' && 'Transmitiendo Audio'}
+                  {status === 'error' && 'Error de conexión'}
+                </h2>
+                <p className="text-slate-400 text-sm mb-8 text-center">
+                  {status === 'waiting' && 'Abre esta app en tu celular e ingresa el PIN:'}
+                  {status === 'connected' && 'El dispositivo receptor está escuchando el audio.'}
+                </p>
+
+                {status === 'waiting' && (
+                  <div className="flex items-center justify-center gap-4 mb-8">
+                    <div className="text-5xl font-mono font-bold tracking-widest text-white">{roomId}</div>
+                    <button onClick={copyToClipboard} className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 transition-colors" title="Copiar PIN">
+                      {copied ? <CheckCircle2 className="w-5 h-5 text-emerald-400" /> : <Copy className="w-5 h-5 text-slate-400" />}
+                    </button>
+                  </div>
+                )}
+
+                <button
+                  onClick={stopSession}
+                  className="px-6 py-3 bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
+                >
+                  <Square className="w-4 h-4 fill-current" />
+                  Detener Transmisión
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* MODO RECEPTOR (TELÉFONO) */}
+        {mode === 'client' && (
+          <div className="flex-1 flex flex-col">
+            <button onClick={stopSession} className="text-slate-400 text-sm hover:text-white mb-6 self-start flex items-center gap-2">
+              &larr; Volver
+            </button>
+
+            {status === 'idle' || status === 'connecting' ? (
+              <form onSubmit={joinRoom} className="bg-slate-900 border border-slate-800 p-6 rounded-3xl">
+                <h3 className="text-lg font-medium text-white mb-4 text-center">Ingresar PIN de la PC</h3>
+                <input
+                  type="number"
+                  value={pinInput}
+                  onChange={(e) => setPinInput(e.target.value.slice(0, 6))}
+                  placeholder="Ej: 123456"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-4 text-center text-3xl font-mono tracking-widest text-white mb-6 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all placeholder:text-slate-700"
+                  autoComplete="off"
+                />
+                <button
+                  type="submit"
+                  disabled={pinInput.length !== 6 || status === 'connecting'}
+                  className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:hover:bg-emerald-600 text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
+                >
+                  {status === 'connecting' ? (
+                    <><div className="w-5 h-5 rounded-full border-2 border-white/30 border-t-white animate-spin" /> Conectando...</>
+                  ) : (
+                    <><Wifi className="w-5 h-5" /> Conectar</>
+                  )}
+                </button>
+                {errorMsg && (
+                  <div className="mt-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2 text-red-400 text-sm">
+                    <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                    <p>{errorMsg}</p>
+                  </div>
+                )}
+              </form>
+            ) : (
+              <div className="bg-slate-900 border border-slate-800 p-8 rounded-3xl flex flex-col items-center">
+                <div className={`w-32 h-32 rounded-full flex items-center justify-center mb-6 relative
+                  ${isAudioPlaying ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                  {isAudioPlaying ? (
+                    <>
+                      <div className="absolute inset-0 rounded-full bg-emerald-500/20 animate-ping opacity-50" />
+                      <Volume2 className="w-12 h-12 relative z-10" />
+                    </>
+                  ) : (
+                    <Play className="w-12 h-12 ml-1" />
+                  )}
+                </div>
+
+                <h2 className="text-xl font-semibold mb-2">
+                  {status === 'connected' ? (isAudioPlaying ? 'Audio Activo' : 'Conectado a la PC') : 'Error'}
+                </h2>
+                
+                {!isAudioPlaying && status === 'connected' && (
+                  <p className="text-amber-400 text-sm mb-6 text-center max-w-[200px]">
+                    Toca el botón para permitir la reproducción de sonido
+                  </p>
+                )}
+
+                {/* Reproductor de Audio Oculto */}
+                <audio ref={remoteAudioRef} autoPlay playsInline controls={false} className="hidden" />
+
+                {!isAudioPlaying && status === 'connected' ? (
+                  <button
+                    onClick={() => {
+                      if (remoteAudioRef.current) {
+                        remoteAudioRef.current.play().then(() => setIsAudioPlaying(true));
+                      }
+                    }}
+                    className="px-8 py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2 mb-4 w-full"
+                  >
+                    <Play className="w-5 h-5 fill-current" />
+                    Iniciar Reproducción
+                  </button>
+                ) : (
+                  <p className="text-slate-400 text-sm mb-8">Escuchando el audio de tu computadora.</p>
+                )}
+
+                <button
+                  onClick={stopSession}
+                  className="px-6 py-3 bg-slate-800 text-slate-300 hover:bg-slate-700 rounded-xl font-medium transition-colors flex items-center justify-center gap-2 w-full"
+                >
+                  Desconectar
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
